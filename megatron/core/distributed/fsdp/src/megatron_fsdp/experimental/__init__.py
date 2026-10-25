@@ -17,7 +17,13 @@
 from .checkpoint import load_checkpoint, save_checkpoint
 from .context import FsdpContext
 from .dbuffer import DBuffer
-from .fully_shard import Placements, fully_shard, fully_shard_context, microbatch
+from .fully_shard import (
+    Placements,
+    fully_shard,
+    fully_shard_context,
+    microbatch,
+    record_execution_order,
+)
 from .optimizer import fully_shard_optimizer, init_optimizer_state
 from .schedule import SchedulePolicy
 
@@ -32,5 +38,6 @@ __all__ = [
     "init_optimizer_state",
     "load_checkpoint",
     "microbatch",
+    "record_execution_order",
     "save_checkpoint",
 ]

@@ -26,6 +26,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
+from .execution_order import ExecutionOrder
 from .module import FsdpModule
 from .schedule import SchedulePolicy
 
@@ -195,6 +196,26 @@ def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
     if dim_names is None or axis not in dim_names:
         raise ValueError(f"Mesh axis {axis!r} is not present in mesh dim names {dim_names}.")
     return dim_names.index(axis)
+
+
+@contextmanager
+def record_execution_order(context: FsdpContext) -> Iterator[None]:
+    """Record one eager forward/backward microbatch for subsequent prefetch.
+
+    Use when module execution differs from construction order. Parameters are
+    gathered on demand while recording; later microbatches use the recorded
+    forward and backward orders with the existing prefetch budgets.
+    Subsequent microbatches must repeat the recorded call order, consistently
+    across data-parallel ranks. Pipeline schedules are outside this API's scope.
+    Discard the context if the recorded pass raises.
+    """
+    context.ensure_finalized()
+    if context._recording_execution_order:
+        raise RuntimeError("Execution-order recording cannot be nested.")
+    context.forward_order, context.backward_order = ExecutionOrder(), ExecutionOrder()
+    context._recording_execution_order = True
+    yield
+    context._recording_execution_order = False
 
 
 @contextmanager

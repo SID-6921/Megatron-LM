@@ -24,6 +24,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     fully_shard_optimizer,
     microbatch,
+    record_execution_order,
 )
 
 
@@ -123,7 +124,7 @@ def test_recorded_prefetch_follows_execution(distributed_setup):
         inputs = torch.full((2, 4), 0.1 * (1 + step + distributed_setup.rank), device=device)
         expected = reference(inputs)
         expected.square().mean().backward()
-        with context.record_execution_order() if step == 0 else nullcontext():
+        with record_execution_order(context) if step == 0 else nullcontext():
             actual = model(inputs)
             actual.square().mean().backward()
         torch.testing.assert_close(actual, expected)

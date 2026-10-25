@@ -14,8 +14,7 @@
 
 """Shared runtime state for Megatron-FSDP modules."""
 
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from weakref import WeakKeyDictionary
 
 import torch
@@ -167,25 +166,6 @@ class FsdpContext:
     def current_stream(self) -> torch.cuda.Stream:
         """Current stream on this context's device."""
         return torch.cuda.current_stream(self.allgather_stream.device)
-
-    @contextmanager
-    def record_execution_order(self) -> Iterator[None]:
-        """Record one eager forward/backward microbatch for subsequent prefetch.
-
-        Use when module execution differs from construction order. Parameters are
-        gathered on demand while recording; later microbatches use the recorded
-        forward and backward orders with the existing prefetch budgets.
-        Subsequent microbatches must repeat the recorded call order, consistently
-        across data-parallel ranks. Pipeline schedules are outside this API's scope.
-        Discard the context if the recorded pass raises.
-        """
-        self.ensure_finalized()
-        if self._recording_execution_order:
-            raise RuntimeError("Execution-order recording cannot be nested.")
-        self.forward_order, self.backward_order = ExecutionOrder(), ExecutionOrder()
-        self._recording_execution_order = True
-        yield
-        self._recording_execution_order = False
 
     def validate_grad_sync(self) -> None:
         """Require a caller-owned wait or a pending autograd completion callback."""
