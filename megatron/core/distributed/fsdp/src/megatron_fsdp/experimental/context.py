@@ -41,7 +41,7 @@ class FsdpContext:
     The caller must call ``finish_grad_sync()`` after all gradient producers,
     including delayed weight-gradient computation, and before consuming gradients.
     """
-    # Prefetch uses construction order unless record_prefetch_order() replaces it
+    # Prefetch uses construction order unless record_execution_order() replaces it
     # with the order observed during a forward/backward microbatch.
     forward_order: ExecutionOrder[nn.Module]
     backward_order: ExecutionOrder[nn.Module]
@@ -93,7 +93,7 @@ class FsdpContext:
         self.caller_managed_grad_sync = caller_managed_grad_sync
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
-        self._recording_prefetch_order = False
+        self._recording_execution_order = False
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
@@ -169,7 +169,7 @@ class FsdpContext:
         return torch.cuda.current_stream(self.allgather_stream.device)
 
     @contextmanager
-    def record_prefetch_order(self) -> Iterator[None]:
+    def record_execution_order(self) -> Iterator[None]:
         """Record one eager forward/backward microbatch for subsequent prefetch.
 
         Use when module execution differs from construction order. Parameters are
@@ -177,21 +177,15 @@ class FsdpContext:
         forward and backward orders with the existing prefetch budgets.
         Subsequent microbatches must repeat the recorded call order, consistently
         across data-parallel ranks. Pipeline schedules are outside this API's scope.
+        Discard the context if the recorded pass raises.
         """
         self.ensure_finalized()
-        if self._recording_prefetch_order:
-            raise RuntimeError("Prefetch-order recording cannot be nested.")
-        previous_orders = self.forward_order, self.backward_order
+        if self._recording_execution_order:
+            raise RuntimeError("Execution-order recording cannot be nested.")
         self.forward_order, self.backward_order = ExecutionOrder(), ExecutionOrder()
-        self._recording_prefetch_order = True
-        try:
-            yield
-        except BaseException:
-            # A partial trace must not become the next microbatch's prefetch order.
-            self.forward_order, self.backward_order = previous_orders
-            raise
-        finally:
-            self._recording_prefetch_order = False
+        self._recording_execution_order = True
+        yield
+        self._recording_execution_order = False
 
     def validate_grad_sync(self) -> None:
         """Require a caller-owned wait or a pending autograd completion callback."""

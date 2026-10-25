@@ -331,7 +331,7 @@ class FsdpModule:
                     raise ValueError(
                         f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
                     )
-            if context._recording_prefetch_order:
+            if context._recording_execution_order:
                 order.append(cast(nn.Module, self))
             else:
                 self._prefetch_parameter_groups(order, prefetch_size)
