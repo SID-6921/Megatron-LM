@@ -16,6 +16,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
     fully_shard,
     fully_shard_context,
@@ -91,7 +92,7 @@ def test_persistent_sharded_storage(distributed_setup, main_params_dtype):
     placements = _default_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=main_params_dtype)
     allocated_before = torch.cuda.memory_allocated(device)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
         fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
@@ -149,7 +150,9 @@ def test_training_step_peak_memory_bounds_full_size_buffers(
     model = MultiChildModel(dim=dim, num_children=8).to(dtype=dtype)
     placements = _default_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    with fully_shard_context(device=device, unify_communication_stream=unify_communication_stream):
+    with fully_shard_context(
+        FsdpContext(device=device, unify_communication_stream=unify_communication_stream)
+    ):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
         fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
@@ -204,7 +207,7 @@ def test_zero1_memory_uses_sharded_optimizer_and_replicated_weight(distributed_s
     model = ElementwiseModel(dim).to(device=device, dtype=dtype)
     mesh = init_device_mesh(device.type, (world_size,))
     placements = _zero1_placements()
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model, mesh=mesh, placements=placements)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01, foreach=False)
     fully_shard_optimizer(optimizer)
@@ -257,7 +260,7 @@ def test_deleted_model_releases_fsdp_storage(distributed_setup):
     # only detects storage retained by the deleted FSDP model itself.
     allocated_before = torch.cuda.memory_allocated(device)
     model = ElementwiseModel(dim=8192).to(dtype=torch.bfloat16, device=device)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     x = torch.ones(1, 8192, dtype=torch.bfloat16, device=device)
@@ -281,7 +284,7 @@ def test_fully_shard_returns_to_resting_memory(distributed_setup):
     model = MultiChildModel(dim=dim, num_children=2).to(dtype=dtype, device=device)
     placements = _default_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
         fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
@@ -357,7 +360,7 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup, placements_
 
     torch.manual_seed(4321)
     model = nn.Sequential(*[nn.Linear(dim, dim, dtype=dtype) for _ in range(layers)]).to(device)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         for layer in model:
             fully_shard(
                 layer,

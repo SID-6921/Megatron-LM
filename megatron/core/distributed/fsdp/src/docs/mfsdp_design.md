@@ -266,9 +266,9 @@ teardown. See https://github.com/NVIDIA/Megatron-LM/pull/6230.
 
 ### FsdpContext
 
-- Created by `fully_shard_context` and shared by every `FsdpModule` constructed in that
-  scope. On exit, it identifies FSDP roots and finalizes the static forward and backward
-  prefetch orders.
+- Pass an `FsdpContext` to `fully_shard_context(context)` to share it with every
+  `FsdpModule` constructed in that scope. On exit, the scope finalizes the FSDP roots
+  and static forward and backward prefetch orders.
 - Per-device all-gather and reduce-scatter streams. Module compute runs on PyTorch’s
   current stream.
 - Last-microbatch state for HSDP/HFSDP gradient accumulation.
