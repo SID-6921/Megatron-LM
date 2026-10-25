@@ -101,7 +101,7 @@ def test_recorded_prefetch_follows_execution(distributed_setup):
     torch.manual_seed(42)
     model = Model(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)).to(device)
     reference = deepcopy(model)
-    with fully_shard_context(device=device) as context:
+    with fully_shard_context(FsdpContext(device=device)) as context:
         for layer in model:
             fully_shard(layer, mesh, _default_placements())
         fully_shard(model, mesh, _default_placements())
