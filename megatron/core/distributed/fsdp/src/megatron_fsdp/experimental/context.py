@@ -14,7 +14,8 @@
 
 """Shared runtime state for Megatron-FSDP modules."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from weakref import WeakKeyDictionary
 
 import torch
@@ -40,9 +41,8 @@ class FsdpContext:
     The caller must call ``finish_grad_sync()`` after all gradient producers,
     including delayed weight-gradient computation, and before consuming gradients.
     """
-    # Static orders used to drive all-gather prefetch. We may want to switch to
-    # capturing runtime order if static module order proves too fragile. Each
-    # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_events``.
+    # Prefetch uses construction order unless record_prefetch_order() replaces it
+    # with the order observed during a forward/backward microbatch.
     forward_order: ExecutionOrder[nn.Module]
     backward_order: ExecutionOrder[nn.Module]
     # Topology metadata must not keep modules alive after construction.
@@ -93,6 +93,7 @@ class FsdpContext:
         self.caller_managed_grad_sync = caller_managed_grad_sync
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
+        self._recording_prefetch_order = False
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
@@ -166,6 +167,31 @@ class FsdpContext:
     def current_stream(self) -> torch.cuda.Stream:
         """Current stream on this context's device."""
         return torch.cuda.current_stream(self.allgather_stream.device)
+
+    @contextmanager
+    def record_prefetch_order(self) -> Iterator[None]:
+        """Record one eager forward/backward microbatch for subsequent prefetch.
+
+        Use when module execution differs from construction order. Parameters are
+        gathered on demand while recording; later microbatches use the recorded
+        forward and backward orders with the existing prefetch budgets.
+        Subsequent microbatches must repeat the recorded call order, consistently
+        across data-parallel ranks. Pipeline schedules are outside this API's scope.
+        """
+        self.ensure_finalized()
+        if self._recording_prefetch_order:
+            raise RuntimeError("Prefetch-order recording cannot be nested.")
+        previous_orders = self.forward_order, self.backward_order
+        self.forward_order, self.backward_order = ExecutionOrder(), ExecutionOrder()
+        self._recording_prefetch_order = True
+        try:
+            yield
+        except BaseException:
+            # A partial trace must not become the next microbatch's prefetch order.
+            self.forward_order, self.backward_order = previous_orders
+            raise
+        finally:
+            self._recording_prefetch_order = False
 
     def validate_grad_sync(self) -> None:
         """Require a caller-owned wait or a pending autograd completion callback."""

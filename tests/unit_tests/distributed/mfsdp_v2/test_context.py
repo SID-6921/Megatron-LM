@@ -6,6 +6,8 @@ Test prefetch-order construction here; test communication/computation overlap
 in ``test_overlap.py``.
 """
 
+from contextlib import nullcontext
+from copy import deepcopy
 from unittest.mock import Mock
 from weakref import ref
 
@@ -13,13 +15,14 @@ import pytest
 import torch
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import DTensor, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
     fully_shard,
     fully_shard_context,
+    fully_shard_optimizer,
     microbatch,
 )
 
@@ -82,6 +85,77 @@ class NestedSiblingModel(nn.Module):
 
 def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
+
+
+def test_recorded_prefetch_follows_execution(distributed_setup):
+    """Learn reordered, repeated calls and preserve training across subsequent microbatches."""
+
+    class Model(nn.Sequential):
+        def forward(self, x):
+            # Registration order is 0, 1; execution is 1, 0, 0.
+            return self[0](self[0](self[1](x)))
+
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    torch.manual_seed(42)
+    model = Model(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)).to(device)
+    reference = deepcopy(model)
+    with fully_shard_context(device=device) as context:
+        for layer in model:
+            fully_shard(layer, mesh, _default_placements())
+        fully_shard(model, mesh, _default_placements())
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    fully_shard_optimizer(optimizer)
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
+
+    prefetched = []
+
+    def check_prefetch(module, _inputs):
+        # The root should prefetch layer 1, which executes first.
+        prefetched.append(
+            [index for index, layer in enumerate(module) if not isinstance(layer.weight, DTensor)]
+        )
+
+    model.register_forward_pre_hook(check_prefetch)
+    for step in range(3):
+        optimizer.zero_grad(set_to_none=True)
+        reference_optimizer.zero_grad(set_to_none=True)
+        inputs = torch.full((2, 4), 0.1 * (1 + step + distributed_setup.rank), device=device)
+        expected = reference(inputs)
+        expected.square().mean().backward()
+        with context.record_prefetch_order() if step == 0 else nullcontext():
+            actual = model(inputs)
+            actual.square().mean().backward()
+        torch.testing.assert_close(actual, expected)
+        assert list(context.forward_order) == [model, model[1], model[0], model[0]]
+        # Shared weights stay materialized until both uses contribute their gradients.
+        assert list(context.backward_order) == [model, model[0], model[1]]
+        for parameter, reference_parameter in zip(model.parameters(), reference.parameters()):
+            torch.distributed.all_reduce(reference_parameter.grad, group=mesh.get_group())
+            reference_parameter.grad.div_(distributed_setup.world_size)
+            torch.testing.assert_close(parameter.grad.full_tensor(), reference_parameter.grad)
+        optimizer.step()
+        reference_optimizer.step()
+        for parameter, reference_parameter in zip(model.parameters(), reference.parameters()):
+            torch.testing.assert_close(parameter.full_tensor(), reference_parameter)
+    assert prefetched == [[], [1], [1]]
+
+
+def test_failed_prefetch_recording_preserves_order(distributed_setup):
+    """A failed recording must not replace the usable prefetch orders with a partial trace."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Linear(4, 4, bias=False).to(device)
+    with fully_shard_context(device=device) as context:
+        fully_shard(model, mesh, _default_placements())
+    previous_orders = context.forward_order, context.backward_order
+    with pytest.raises(RuntimeError, match="recording failed"):
+        with context.record_prefetch_order():
+            model(torch.ones(2, 4, device=device)).sum().backward()
+            raise RuntimeError("recording failed")
+    assert (context.forward_order, context.backward_order) == previous_orders
+    model(torch.ones(2, 4, device=device)).sum().backward()
+    assert list(context.forward_order) == list(context.backward_order) == [model]
 
 
 def test_context_defaults_to_current_cuda_device(distributed_setup):

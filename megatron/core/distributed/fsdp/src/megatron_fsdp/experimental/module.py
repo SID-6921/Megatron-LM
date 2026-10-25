@@ -322,17 +322,19 @@ class FsdpModule:
             context = self.context
             match phase:
                 case Phase.FORWARD:
-                    self._prefetch_parameter_groups(
-                        context.forward_order, self._schedule_policy.forward_prefetch_size
-                    )
+                    order = context.forward_order
+                    prefetch_size = self._schedule_policy.forward_prefetch_size
                 case Phase.BACKWARD:
-                    self._prefetch_parameter_groups(
-                        context.backward_order, self._schedule_policy.backward_prefetch_size
-                    )
+                    order = context.backward_order
+                    prefetch_size = self._schedule_policy.backward_prefetch_size
                 case _:
                     raise ValueError(
                         f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
                     )
+            if context._recording_prefetch_order:
+                order.append(cast(nn.Module, self))
+            else:
+                self._prefetch_parameter_groups(order, prefetch_size)
 
     def _prefetch_parameter_groups(
         self, order: ExecutionOrder[nn.Module], prefetch_size: int | None
