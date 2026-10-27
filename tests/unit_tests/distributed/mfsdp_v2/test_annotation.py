@@ -14,6 +14,7 @@ from torch.distributed.tensor import Shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
+    PrefetchOrder,
     fully_shard,
     fully_shard_context,
 )
@@ -92,6 +93,55 @@ def _setup_nvtx_recording(monkeypatch: pytest.MonkeyPatch, events: list[NvtxEven
 def _forward_backward_events(events: list[NvtxEvent]) -> list[NvtxEvent]:
     """Return the forward/backward ranges asserted by the lifecycle tests."""
     return [event for event in events if event.operation in ("forward", "backward")]
+
+
+def test_recorded_prefetch_follows_execution(distributed_setup, monkeypatch):
+    """Prefetch follows execution when submodules are registered in the opposite order."""
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.second = nn.Linear(4, 4, bias=False)
+            self.first = nn.Linear(4, 4, bias=False)
+
+        def forward(self, x):
+            return self.second(self.first(x))
+
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = Model().to(device)
+    with fully_shard_context(
+        FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)
+    ) as context:
+        for layer in model.children():
+            fully_shard(layer, mesh, _default_placements())
+        fully_shard(model, mesh, _default_placements())
+
+    inputs = torch.ones(2, 4, device=device)
+    model(inputs).sum().backward()
+    assert list(context.forward_order) == [model, model.first, model.second]
+    assert list(context.backward_order) == [model, model.second, model.first]
+
+    events: list[NvtxEvent] = []
+    _setup_nvtx_recording(monkeypatch, events)
+    model(inputs).sum().backward()
+
+    assert [
+        event
+        for event in events
+        if event.kind == "push" and event.operation in ("forward", "backward", "prefetch")
+    ] == [
+        NvtxEvent("push", "<root>", "forward"),
+        NvtxEvent("push", "first", "prefetch"),
+        NvtxEvent("push", "first", "forward"),
+        NvtxEvent("push", "second", "prefetch"),
+        NvtxEvent("push", "second", "forward"),
+        NvtxEvent("push", "<root>", "backward"),
+        NvtxEvent("push", "second", "prefetch"),
+        NvtxEvent("push", "second", "backward"),
+        NvtxEvent("push", "first", "prefetch"),
+        NvtxEvent("push", "first", "backward"),
+    ]
 
 
 def test_fsdp_training_hooks_emit_operation_nvtx_ranges(distributed_setup, monkeypatch):

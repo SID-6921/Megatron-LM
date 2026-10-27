@@ -3,7 +3,7 @@
 """Coverage for occurrence-based FSDP prefetch and weak module ownership."""
 
 import gc
-from unittest.mock import Mock
+from unittest.mock import MagicMock
 from weakref import ref
 
 import pytest
@@ -25,7 +25,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import
 )
 def test_prefetch_replays_occurrences(budget, expected):
     """Reused modules have occurrence-specific successors under every prefetch budget."""
-    modules = [Mock(spec=FsdpModule, num_parameter_elements=1) for _ in range(3)]
+    modules = [MagicMock(spec=FsdpModule, num_parameter_elements=1) for _ in range(3)]
     prefetched = []
     for module in modules:
         # Prefetch passes the successor's compute phase; record only which module it targets.

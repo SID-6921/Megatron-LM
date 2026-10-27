@@ -13,12 +13,11 @@ import pytest
 import torch
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
-    PrefetchOrder,
     fully_shard,
     fully_shard_context,
     microbatch,
@@ -83,51 +82,6 @@ class NestedSiblingModel(nn.Module):
 
 def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
-
-
-def test_recorded_prefetch_follows_execution(distributed_setup):
-    """Prefetch follows execution when submodules are registered in the opposite order."""
-
-    class Model(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.second = nn.Linear(4, 4, bias=False)
-            self.first = nn.Linear(4, 4, bias=False)
-
-        def forward(self, x):
-            return self.second(self.first(x))
-
-    device = distributed_setup.device
-    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = Model().to(device)
-    with fully_shard_context(
-        FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)
-    ) as context:
-        for layer in model.children():
-            fully_shard(layer, mesh, _default_placements())
-        fully_shard(model, mesh, _default_placements())
-
-    inputs = torch.ones(2, 4, device=device)
-    model(inputs).sum().backward()
-    assert list(context.forward_order) == [model, model.first, model.second]
-    assert list(context.backward_order) == [model, model.second, model.first]
-
-    prefetched = []
-
-    def record_prefetched_layers(module, _args):
-        # The root's automatic hook has already prefetched the first layer of this pass.
-        prefetched.append(
-            [
-                name
-                for name, layer in module.named_children()
-                if not isinstance(layer.weight, DTensor)
-            ]
-        )
-
-    model.register_forward_pre_hook(record_prefetched_layers)
-    model.register_full_backward_pre_hook(record_prefetched_layers)
-    model(inputs).sum().backward()
-    assert prefetched == [["first"], ["second"]]
 
 
 def test_context_defaults_to_current_cuda_device(distributed_setup):
