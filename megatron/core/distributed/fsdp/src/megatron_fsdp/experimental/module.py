@@ -443,16 +443,20 @@ class FsdpModule:
         #   h1 = block(fuse(h0, shifted_embeddings_1))
         #   h2 = block(fuse(h1, shifted_embeddings_2))
         #   (loss1(h1) + loss2(h2)).backward()
-        # Backward enters depth 2 then depth 1, invoking this pre-hook twice.
-        # Each shared parameter's post-accumulate hook fires once after both uses
-        # contribute, so post_backward() has not reset BACKWARD when depth 1 enters.
+        # In ordinary autograd, backward enters depth 2 then depth 1, invoking this
+        # pre-hook twice on the same wrapper. Each shared parameter's post-accumulate
+        # hook fires once after both uses contribute, so our post_backward() has not
+        # reset BACKWARD when depth 1 enters.
         # Initialize the phase and NVTX range once, but record and advance prefetch
         # for every invocation.
         # TODO: Separate post_backward (phase/weight release) from post_accumulate_grad
         # (gradient reduction): https://github.com/NVIDIA/Megatron-LM/pull/7902
-        # With gradient-requiring inputs, post_backward would run once per depth,
-        # resetting the phase so the next depth can gather its weights normally.
-        # post_accumulate_grad would run once after both uses contribute gradients.
+        # For invocations with gradient-requiring inputs:
+        # In shared MTP, post_backward would run twice (once per depth), resetting
+        # the phase after each invocation. Depth 1 could then enter from RESTING
+        # and gather its weights normally, without this guard. post_accumulate_grad would
+        # run once, after both depths' local gradient contributions have accumulated,
+        # and perform the reduction.
         if self.phase is not Phase.BACKWARD:
             self.phase = Phase.BACKWARD
             torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
