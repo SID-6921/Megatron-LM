@@ -13,6 +13,7 @@ from torch.distributed.tensor import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
+    SchedulePolicy,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
@@ -29,8 +30,9 @@ def _sharded_unit(setup, model, grad_accumulation_count):
             model,
             mesh=mesh,
             placements=placements,
-            register_hooks=False,
-            grad_accumulation_count=grad_accumulation_count,
+            schedule_policy=SchedulePolicy(
+                register_hooks=False, grad_accumulation_count=grad_accumulation_count
+            ),
         )
     # The test drives materialization around each GraphTask; the completion hook
     # only reduces gradients once all declared contributions have accumulated.

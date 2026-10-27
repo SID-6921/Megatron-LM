@@ -70,8 +70,6 @@ def fully_shard(
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
     grad_scale: float = 1.0,
     schedule_policy: SchedulePolicy = SchedulePolicy(),
-    register_hooks: bool = True,
-    grad_accumulation_count: int | None = None,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -98,15 +96,8 @@ def fully_shard(
             For per-token loss, ``grad_scale=mesh.size()`` cancels mesh averaging
             so gradients are summed. Normalize once by the global token count after
             accumulating all microbatches and before clipping or updating weights.
-        schedule_policy: Communication scheduling policy for this FSDP module.
-        register_hooks: Whether to register the automatic forward and backward execution
-            hooks on ``module``. Disable this when an external scheduler invokes the
-            corresponding FSDP lifecycle methods explicitly. The state-dict safety hook
-            is registered independently.
-        grad_accumulation_count: Total parameter-gradient callbacks per reduction
-            window, including contributions from separate GraphTasks and delayed
-            weight gradients. Defaults to one per owned trainable parameter.
-            The scheduler must declare the complete count before sharding the unit.
+        schedule_policy: Prefetching, execution-hook, and gradient-completion policy
+            for this FSDP module.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -137,8 +128,6 @@ def fully_shard(
             grad_scale=grad_scale,
             schedule_policy=schedule_policy,
             use_symmetric_memory=context.use_symmetric_memory,
-            register_hooks=register_hooks,
-            grad_accumulation_count=grad_accumulation_count,
         )
     except Exception:
         module.__class__ = original_cls
