@@ -204,8 +204,8 @@ class FsdpContext:
         self.current_stream().wait_stream(self.reduce_scatter_stream)
 
     def post_backward(self) -> None:
-        """Complete backward for all roots sharing this context."""
-        self.run_delayed_post_backward_callbacks()
+        """Finish backward cleanup and automatically synchronize the last microbatch."""
+        self._run_delayed_post_backward_callbacks()
         self._recording_execution_order = False
         # Standalone training can call optimizer.step() immediately after backward.
         # Wait for reductions on the last microbatch; earlier microbatches keep
@@ -215,8 +215,8 @@ class FsdpContext:
             self.finish_grad_sync()
         self._post_backward_hook_registered = False
 
-    def run_delayed_post_backward_callbacks(self) -> None:
-        """Run deferred weight cleanup after each backward or scheduler chunk."""
+    def _run_delayed_post_backward_callbacks(self) -> None:
+        """Run deferred module completion callbacks once."""
         # Finish children before parents to close nested backward NVTX ranges.
         while self._delayed_post_backward_callbacks:
             module, callback = self._delayed_post_backward_callbacks.pop()

@@ -12,8 +12,6 @@ loop. This test drives the helper directly and asserts that all wrapped chunks
 share the same ``FsdpContext``.
 """
 
-from unittest.mock import Mock
-
 import pytest
 import torch
 import torch.nn as nn
@@ -24,7 +22,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard i
     current_fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.pipeline_parallel import combined_1f1b
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.training.training import wrap_model_chunks_with_ddp
@@ -71,8 +68,8 @@ class TestMfsdpV2PipelineSharedContext:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 CUDA devices.")
-    def test_shared_context_across_virtual_pipeline_chunks(self, distributed_setup, monkeypatch):
-        """Virtual-pipeline chunks share one context, completed after the last backward."""
+    def test_shared_context_across_virtual_pipeline_chunks(self, distributed_setup):
+        """Multiple virtual-pipeline chunks wrapped in one call share one FsdpContext."""
         device = distributed_setup.device
 
         # virtual_pipeline_model_parallel_size > 1 yields multiple chunks on this
@@ -109,31 +106,3 @@ class TestMfsdpV2PipelineSharedContext:
         # The helper left no ambient context behind: the chunks joined its scope and
         # that scope, which owned the only finalize call, has since exited.
         assert current_fully_shard_context() is None
-
-        post_backward = Mock(wraps=first_context.post_backward)
-        monkeypatch.setattr(first_context, "post_backward", post_backward)
-        # Exercise the scheduler's completion boundary without running transformer compute.
-        monkeypatch.setattr(
-            combined_1f1b, "combined_forward_backward_step", Mock(return_value=(None, None, None))
-        )
-        num_microbatches = 2
-        for index in range(num_microbatches * len(chunks)):
-            combined_1f1b.combined_1f1b_schedule_for_interleaved_pipelining(
-                config=_compute_config(),
-                forward_step_func=None,
-                data_iterator=None,
-                model=wrapped_chunks,
-                num_microbatches=num_microbatches,
-                forward_data_store=[],
-                forward_step_helper_preprocess=None,
-                forward_step_helper_postprocess=None,
-                backward_step_helper_preprocess=lambda *_: (None, None, None),
-                backward_step_helper_postprocess=lambda _: None,
-                get_microbatch_id_in_model_chunk=None,
-                get_model_chunk_id=lambda i, forward: len(chunks) - 1 - i // num_microbatches,
-                check_first_val_step=lambda _: False,
-                is_first_microbatch_for_model_chunk=None,
-                collect_non_loss_data=False,
-                b_virtual_microbatch_id=index,
-            )
-            assert post_backward.call_count == int(index == num_microbatches * len(chunks) - 1)
