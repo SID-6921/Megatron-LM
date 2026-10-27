@@ -18,6 +18,7 @@ from torch.distributed.tensor import DTensor, Shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
+    PrefetchOrder,
     fully_shard,
     fully_shard_context,
     microbatch,
@@ -99,7 +100,9 @@ def test_recorded_prefetch_follows_execution(distributed_setup):
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = Model().to(device)
-    with fully_shard_context(FsdpContext(device=device, record_execution_order=True)) as context:
+    with fully_shard_context(
+        FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)
+    ) as context:
         for layer in model.children():
             fully_shard(layer, mesh, _default_placements())
         fully_shard(model, mesh, _default_placements())

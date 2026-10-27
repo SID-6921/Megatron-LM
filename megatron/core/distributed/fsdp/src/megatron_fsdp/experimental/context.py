@@ -14,6 +14,7 @@
 
 """Shared runtime state for Megatron-FSDP modules."""
 
+import enum
 from collections.abc import Callable
 from weakref import WeakKeyDictionary
 
@@ -21,6 +22,13 @@ import torch
 from torch import nn
 
 from .execution_order import ExecutionOrder
+
+
+class PrefetchOrder(enum.Enum):
+    """How to choose the module order used for prefetching."""
+
+    REGISTRATION = enum.auto()
+    RECORDED = enum.auto()
 
 
 class FsdpContext:
@@ -59,7 +67,7 @@ class FsdpContext:
         unify_communication_stream: bool = False,
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
         caller_managed_grad_sync: bool = False,
-        record_execution_order: bool = False,
+        prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -80,11 +88,12 @@ class FsdpContext:
                 retaining automatic weight cleanup. The caller must
                 call ``finish_grad_sync()`` after all backward work and before reading or
                 modifying gradients.
-            record_execution_order: Gather parameters on demand and record module calls
-                until the first ``post_backward()``. Subsequent passes prefetch using those
-                orders and must repeat them consistently across data-parallel ranks.
-                Recording currently requires the ordinary module hooks; combined 1F1B
-                bypasses them. Discard the context if the recorded pass raises.
+            prefetch_order: ``REGISTRATION`` uses module registration order. ``RECORDED``
+                gathers parameters on demand and records module calls until the first
+                ``post_backward()``. Subsequent passes prefetch using those orders and must
+                repeat them consistently across data-parallel ranks. Recording currently
+                requires the ordinary module hooks; combined 1F1B bypasses them. Discard
+                the context if the recorded pass raises.
         """
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -97,7 +106,7 @@ class FsdpContext:
         self.caller_managed_grad_sync = caller_managed_grad_sync
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
-        self._recording_execution_order = record_execution_order
+        self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
