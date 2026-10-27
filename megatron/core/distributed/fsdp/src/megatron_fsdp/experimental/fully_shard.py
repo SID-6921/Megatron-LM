@@ -205,6 +205,7 @@ def record_execution_order(context: FsdpContext) -> Iterator[None]:
     Use when module execution differs from construction order. Parameters are
     gathered on demand while recording; later microbatches use the recorded
     forward and backward orders with the existing prefetch budgets.
+    Only modules participating in backward enter the backward order.
     Subsequent microbatches must repeat the recorded call order, consistently
     across data-parallel ranks. Pipeline schedules are outside this API's scope.
     Discard the context if the recorded pass raises.

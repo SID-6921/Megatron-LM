@@ -291,7 +291,11 @@ class FsdpModule:
 
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
         # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
-        self.unshard(Phase.FORWARD, prefetch=not is_recomputing)
+        if context._recording_execution_order and not is_recomputing:
+            context.forward_order.append(cast(nn.Module, self))
+        self.unshard(
+            Phase.FORWARD, prefetch=not is_recomputing and not context._recording_execution_order
+        )
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
@@ -322,19 +326,17 @@ class FsdpModule:
             context = self.context
             match phase:
                 case Phase.FORWARD:
-                    order = context.forward_order
-                    prefetch_size = self._schedule_policy.forward_prefetch_size
+                    self._prefetch_parameter_groups(
+                        context.forward_order, self._schedule_policy.forward_prefetch_size
+                    )
                 case Phase.BACKWARD:
-                    order = context.backward_order
-                    prefetch_size = self._schedule_policy.backward_prefetch_size
+                    self._prefetch_parameter_groups(
+                        context.backward_order, self._schedule_policy.backward_prefetch_size
+                    )
                 case _:
                     raise ValueError(
                         f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
                     )
-            if context._recording_execution_order:
-                order.append(cast(nn.Module, self))
-            else:
-                self._prefetch_parameter_groups(order, prefetch_size)
 
     def _prefetch_parameter_groups(
         self, order: ExecutionOrder[nn.Module], prefetch_size: int | None
@@ -434,40 +436,26 @@ class FsdpModule:
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
-        # Shared-layer MTP (mtp_use_repeated_layer=True) reuses the same FSDP block:
-        #   h1 = block(fuse(h0, shifted_embeddings_1))
-        #   h2 = block(fuse(h1, shifted_embeddings_2))
-        #   (loss1(h1) + loss2(h2)).backward()
-        # In ordinary autograd, backward enters depth 2 then depth 1, invoking this
-        # pre-hook twice on the same wrapper. Each shared parameter's post-accumulate
-        # hook fires once after both uses contribute, so our post_backward() has not
-        # reset BACKWARD when depth 1 enters.
-        # TODO: Separate post_backward (phase/weight release) from grads_ready (reduction).
-        # In shared MTP, post_backward would run twice (once per depth), resetting
-        # the phase after each invocation. Depth 1 could then enter from RESTING
-        # and gather its weights normally, without this guard. grads_ready would
-        # run once, after both depths' local gradient contributions have accumulated,
-        # and perform the reduction.
-        # This likely requires addressing static prefetch order for repeated invocations first:
-        # https://github.com/NVIDIA/Megatron-LM/issues/7764
-        if self.phase is Phase.BACKWARD:
-            return
-        self.phase = Phase.BACKWARD
-        torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
-        current_stream = context.current_stream()
-        if self.is_root():
-            context.register_post_backward_hook()
-            # Fork the reduce-scatter stream from the current stream once, at the
-            # start of backward, so every module's post-backward reduce-scatter is
-            # part of any active CUDA-graph capture. A stream only joins the
-            # capture via this wait_stream edge; without it the first allocation on
-            # the reduce-scatter stream falls back to a raw cudaMalloc, which is
-            # illegal during capture. Later modules are covered by the post-copy
-            # fork each preceding module issues before its collective.
-            context.reduce_scatter_stream.wait_stream(current_stream)
+        if context._recording_execution_order:
+            context.backward_order.append(cast(nn.Module, self))
+        # Shared layers stay in BACKWARD until all uses accumulate their gradients.
+        # Initialize once, but advance prefetch for every invocation.
+        if self.phase is not Phase.BACKWARD:
+            self.phase = Phase.BACKWARD
+            torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
+            if self.is_root():
+                context.register_post_backward_hook()
+                # Fork the reduce-scatter stream from the current stream once, at the
+                # start of backward, so every module's post-backward reduce-scatter is
+                # part of any active CUDA-graph capture. A stream only joins the
+                # capture via this wait_stream edge; without it the first allocation on
+                # the reduce-scatter stream falls back to a raw cudaMalloc, which is
+                # illegal during capture. Later modules are covered by the post-copy
+                # fork each preceding module issues before its collective.
+                context.reduce_scatter_stream.wait_stream(context.current_stream())
 
-        self.unshard(Phase.BACKWARD, prefetch=True)
+        self.unshard(Phase.BACKWARD, prefetch=not context._recording_execution_order)
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""

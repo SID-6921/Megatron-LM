@@ -89,17 +89,19 @@ def _default_placements() -> Placements:
 
 
 def test_recorded_prefetch_follows_execution(distributed_setup):
-    """Learn reordered, repeated calls and preserve training across subsequent microbatches."""
+    """Record reordered, repeated, and forward-only calls, then replay prefetch during training."""
 
     class Model(nn.Sequential):
         def forward(self, x):
-            # Registration order is 0, 1; execution is 1, 0, 0.
-            return self[0](self[0](self[1](x)))
+            # Registration order is 0, 1, 2; execution is 2, 1, 0, 0.
+            return self[0](self[0](self[1](self[2](x))))
 
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     torch.manual_seed(42)
-    model = Model(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)).to(device)
+    model = Model(*(nn.Linear(4, 4, bias=False) for _ in range(3))).to(device)
+    # Layer 2 receives ordinary input data, so freezing it removes its backward graph.
+    model[2].requires_grad_(False)
     reference = deepcopy(model)
     with fully_shard_context(FsdpContext(device=device)) as context:
         for layer in model:
@@ -112,7 +114,7 @@ def test_recorded_prefetch_follows_execution(distributed_setup):
     prefetched = []
 
     def check_prefetch(module, _inputs):
-        # The root should prefetch layer 1, which executes first.
+        # The root should prefetch layer 2, which executes first.
         prefetched.append(
             [index for index, layer in enumerate(module) if not isinstance(layer.weight, DTensor)]
         )
@@ -128,10 +130,11 @@ def test_recorded_prefetch_follows_execution(distributed_setup):
             actual = model(inputs)
             actual.square().mean().backward()
         torch.testing.assert_close(actual, expected)
-        assert list(context.forward_order) == [model, model[1], model[0], model[0]]
-        # Shared weights stay materialized until both uses contribute their gradients.
-        assert list(context.backward_order) == [model, model[0], model[1]]
+        assert list(context.forward_order) == [model, model[2], model[1], model[0], model[0]]
+        assert list(context.backward_order) == [model, model[0], model[0], model[1]]
         for parameter, reference_parameter in zip(model.parameters(), reference.parameters()):
+            if not reference_parameter.requires_grad:
+                continue
             torch.distributed.all_reduce(reference_parameter.grad, group=mesh.get_group())
             reference_parameter.grad.div_(distributed_setup.world_size)
             torch.testing.assert_close(parameter.grad.full_tensor(), reference_parameter.grad)
@@ -139,7 +142,7 @@ def test_recorded_prefetch_follows_execution(distributed_setup):
         reference_optimizer.step()
         for parameter, reference_parameter in zip(model.parameters(), reference.parameters()):
             torch.testing.assert_close(parameter.full_tensor(), reference_parameter)
-    assert prefetched == [[], [1], [1]]
+    assert prefetched == [[], [2], [2]]
 
 
 def test_context_defaults_to_current_cuda_device(distributed_setup):
