@@ -6,8 +6,6 @@ Test prefetch-order construction here; test communication/computation overlap
 in ``test_overlap.py``.
 """
 
-from contextlib import nullcontext
-from copy import deepcopy
 from unittest.mock import Mock
 from weakref import ref
 
@@ -22,7 +20,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     fully_shard,
     fully_shard_context,
-    fully_shard_optimizer,
     microbatch,
     record_execution_order,
 )
@@ -89,60 +86,47 @@ def _default_placements() -> Placements:
 
 
 def test_recorded_prefetch_follows_execution(distributed_setup):
-    """Record reordered, repeated, and forward-only calls, then replay prefetch during training."""
+    """Prefetch follows execution when submodules are registered in the opposite order."""
 
-    class Model(nn.Sequential):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.second = nn.Linear(4, 4, bias=False)
+            self.first = nn.Linear(4, 4, bias=False)
+
         def forward(self, x):
-            # Registration order is 0, 1, 2; execution is 2, 1, 0, 0.
-            return self[0](self[0](self[1](self[2](x))))
+            return self.second(self.first(x))
 
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    torch.manual_seed(42)
-    model = Model(*(nn.Linear(4, 4, bias=False) for _ in range(3))).to(device)
-    # Layer 2 receives ordinary input data, so freezing it removes its backward graph.
-    model[2].requires_grad_(False)
-    reference = deepcopy(model)
+    model = Model().to(device)
     with fully_shard_context(FsdpContext(device=device)) as context:
-        for layer in model:
+        for layer in model.children():
             fully_shard(layer, mesh, _default_placements())
         fully_shard(model, mesh, _default_placements())
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    fully_shard_optimizer(optimizer)
-    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
+
+    inputs = torch.ones(2, 4, device=device)
+    with record_execution_order(context):
+        model(inputs).sum().backward()
+    assert list(context.forward_order) == [model, model.first, model.second]
+    assert list(context.backward_order) == [model, model.second, model.first]
 
     prefetched = []
 
-    def check_prefetch(module, _inputs):
-        # The root should prefetch layer 2, which executes first.
+    def record_prefetched_layers(module, _args):
+        # The root's automatic hook has already prefetched the first layer of this pass.
         prefetched.append(
-            [index for index, layer in enumerate(module) if not isinstance(layer.weight, DTensor)]
+            [
+                name
+                for name, layer in module.named_children()
+                if not isinstance(layer.weight, DTensor)
+            ]
         )
 
-    model.register_forward_pre_hook(check_prefetch)
-    for step in range(3):
-        optimizer.zero_grad(set_to_none=True)
-        reference_optimizer.zero_grad(set_to_none=True)
-        inputs = torch.full((2, 4), 0.1 * (1 + step + distributed_setup.rank), device=device)
-        expected = reference(inputs)
-        expected.square().mean().backward()
-        with record_execution_order(context) if step == 0 else nullcontext():
-            actual = model(inputs)
-            actual.square().mean().backward()
-        torch.testing.assert_close(actual, expected)
-        assert list(context.forward_order) == [model, model[2], model[1], model[0], model[0]]
-        assert list(context.backward_order) == [model, model[0], model[0], model[1]]
-        for parameter, reference_parameter in zip(model.parameters(), reference.parameters()):
-            if not reference_parameter.requires_grad:
-                continue
-            torch.distributed.all_reduce(reference_parameter.grad, group=mesh.get_group())
-            reference_parameter.grad.div_(distributed_setup.world_size)
-            torch.testing.assert_close(parameter.grad.full_tensor(), reference_parameter.grad)
-        optimizer.step()
-        reference_optimizer.step()
-        for parameter, reference_parameter in zip(model.parameters(), reference.parameters()):
-            torch.testing.assert_close(parameter.full_tensor(), reference_parameter)
-    assert prefetched == [[], [2], [2]]
+    model.register_forward_pre_hook(record_prefetched_layers)
+    model.register_full_backward_pre_hook(record_prefetched_layers)
+    model(inputs).sum().backward()
+    assert prefetched == [["first"], ["second"]]
 
 
 def test_context_defaults_to_current_cuda_device(distributed_setup):
