@@ -20,6 +20,7 @@ from torch.utils.checkpoint import checkpoint
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
+    PrefetchOrder,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
@@ -256,7 +257,7 @@ def test_fully_shard_sgd_losses_match_baseline(
 
 
 def test_shared_mtp_backward_matches_baseline(distributed_setup):
-    """Shared-layer MTP should match unsharded training over multiple SGD steps."""
+    """Recorded shared-layer MTP should match unsharded training over multiple SGD steps."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -290,13 +291,18 @@ def test_shared_mtp_backward_matches_baseline(distributed_setup):
 
     torch.manual_seed(1234)
     model = TinySharedMTP(width, vocab_size).to(device)
-    with fully_shard_context(FsdpContext(device=device)):
+    with fully_shard_context(
+        FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)
+    ) as context:
         fully_shard(model.shared_block, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     fully_shard_optimizer(optimizer)
     losses = train(model, optimizer, inputs, reduce_wgrad=False)
 
+    assert list(context.forward_order) == [model, model.shared_block, model.shared_block]
+    # Shared weights stay materialized until both depths contribute gradients.
+    assert list(context.backward_order) == [model, model.shared_block]
     torch.testing.assert_close(torch.stack(losses), torch.stack(baseline_losses))
 
 

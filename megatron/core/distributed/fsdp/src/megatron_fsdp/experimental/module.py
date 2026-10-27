@@ -436,9 +436,6 @@ class FsdpModule:
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
-        context = self.context
-        if context._recording_execution_order:
-            context.backward_order.append(cast(nn.Module, self))
         # Shared-layer MTP (mtp_use_repeated_layer=True) reuses the same FSDP block:
         #   h1 = block(fuse(h0, shifted_embeddings_1))
         #   h2 = block(fuse(h1, shifted_embeddings_2))
@@ -447,8 +444,6 @@ class FsdpModule:
         # pre-hook twice on the same wrapper. Each shared parameter's post-accumulate
         # hook fires once after both uses contribute, so our post_backward() has not
         # reset BACKWARD when depth 1 enters.
-        # Initialize the phase and NVTX range once, but record and advance prefetch
-        # for every invocation.
         # TODO: Separate post_backward (phase/weight release) from post_accumulate_grad
         # (gradient reduction): https://github.com/NVIDIA/Megatron-LM/pull/7902
         # For invocations with gradient-requiring inputs:
@@ -457,19 +452,24 @@ class FsdpModule:
         # and gather its weights normally, without this guard. post_accumulate_grad would
         # run once, after both depths' local gradient contributions have accumulated,
         # and perform the reduction.
-        if self.phase is not Phase.BACKWARD:
-            self.phase = Phase.BACKWARD
-            torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
-            if self.is_root():
-                context.register_post_backward_hook()
-                # Fork the reduce-scatter stream from the current stream once, at the
-                # start of backward, so every module's post-backward reduce-scatter is
-                # part of any active CUDA-graph capture. A stream only joins the
-                # capture via this wait_stream edge; without it the first allocation on
-                # the reduce-scatter stream falls back to a raw cudaMalloc, which is
-                # illegal during capture. Later modules are covered by the post-copy
-                # fork each preceding module issues before its collective.
-                context.reduce_scatter_stream.wait_stream(context.current_stream())
+        if self.phase is Phase.BACKWARD:
+            return
+        self.phase = Phase.BACKWARD
+        torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
+        context = self.context
+        if context._recording_execution_order:
+            context.backward_order.append(cast(nn.Module, self))
+        current_stream = context.current_stream()
+        if self.is_root():
+            context.register_post_backward_hook()
+            # Fork the reduce-scatter stream from the current stream once, at the
+            # start of backward, so every module's post-backward reduce-scatter is
+            # part of any active CUDA-graph capture. A stream only joins the
+            # capture via this wait_stream edge; without it the first allocation on
+            # the reduce-scatter stream falls back to a raw cudaMalloc, which is
+            # illegal during capture. Later modules are covered by the post-copy
+            # fork each preceding module issues before its collective.
+            context.reduce_scatter_stream.wait_stream(current_stream)
 
         self.unshard(Phase.BACKWARD, prefetch=not context._recording_execution_order)
 
