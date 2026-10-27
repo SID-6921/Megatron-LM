@@ -7,12 +7,75 @@ from unittest.mock import MagicMock
 from weakref import ref
 
 import pytest
+import torch
 from torch import nn
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
+    Placements,
+    PrefetchOrder,
+    fully_shard,
+    fully_shard_context,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionOrder,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from tests.unit_tests.distributed.mfsdp_v2.test_annotation import NvtxEvent, _setup_nvtx_recording
+
+
+def test_recorded_prefetch_follows_execution(distributed_setup, monkeypatch):
+    """Prefetch follows execution when submodules are registered in the opposite order."""
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.second = nn.Linear(4, 4, bias=False)
+            self.first = nn.Linear(4, 4, bias=False)
+
+        def forward(self, x):
+            return self.second(self.first(x))
+
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = Model().to(device)
+    placements = Placements(
+        dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+    )
+    with fully_shard_context(
+        FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)
+    ) as context:
+        for layer in model.children():
+            fully_shard(layer, mesh, placements)
+        fully_shard(model, mesh, placements)
+
+    inputs = torch.ones(2, 4, device=device)
+    model(inputs).sum().backward()
+    assert list(context.forward_order) == [model, model.first, model.second]
+    assert list(context.backward_order) == [model, model.second, model.first]
+
+    events: list[NvtxEvent] = []
+    _setup_nvtx_recording(monkeypatch, events)
+    model(inputs).sum().backward()
+
+    assert [
+        event
+        for event in events
+        if event.kind == "push" and event.operation in ("forward", "backward", "prefetch")
+    ] == [
+        NvtxEvent("push", "<root>", "forward"),
+        NvtxEvent("push", "first", "prefetch"),
+        NvtxEvent("push", "first", "forward"),
+        NvtxEvent("push", "second", "prefetch"),
+        NvtxEvent("push", "second", "forward"),
+        NvtxEvent("push", "<root>", "backward"),
+        NvtxEvent("push", "second", "prefetch"),
+        NvtxEvent("push", "second", "backward"),
+        NvtxEvent("push", "first", "prefetch"),
+        NvtxEvent("push", "first", "backward"),
+    ]
 
 
 @pytest.mark.parametrize(
