@@ -205,6 +205,7 @@ class FsdpContext:
 
     def post_backward(self) -> None:
         """Complete backward for all roots sharing this context."""
+        self.run_delayed_post_backward_callbacks()
         self._recording_execution_order = False
         # Standalone training can call optimizer.step() immediately after backward.
         # Wait for reductions on the last microbatch; earlier microbatches keep
@@ -212,6 +213,7 @@ class FsdpContext:
         # after its schedule completes, including delayed weight gradients.
         if not self.caller_managed_grad_sync and self.is_last_microbatch:
             self.finish_grad_sync()
+        self._post_backward_hook_registered = False
 
     def run_delayed_post_backward_callbacks(self) -> None:
         """Run deferred weight cleanup after each backward or scheduler chunk."""
@@ -219,11 +221,6 @@ class FsdpContext:
         while self._delayed_post_backward_callbacks:
             module, callback = self._delayed_post_backward_callbacks.pop()
             callback(module)
-
-    def _post_backward_hook(self) -> None:
-        self.run_delayed_post_backward_callbacks()
-        self.post_backward()
-        self._post_backward_hook_registered = False
 
     def register_post_backward_hook(self) -> None:
         """Register one final callback for deferred cleanup and optional gradient sync.
@@ -242,7 +239,7 @@ class FsdpContext:
         # TODO(wujingyue): Switch to torch.autograd.graph.queue_callback() when Megatron-LM
         # requires a PyTorch version that includes it:
         # https://github.com/pytorch/pytorch/pull/193958
-        torch.autograd.Variable._execution_engine.queue_callback(self._post_backward_hook)
+        torch.autograd.Variable._execution_engine.queue_callback(self.post_backward)
 
 
 def _collect_backward_order(
