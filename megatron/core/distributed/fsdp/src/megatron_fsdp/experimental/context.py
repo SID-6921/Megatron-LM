@@ -42,7 +42,6 @@ class FsdpContext:
     is_last_microbatch: bool
     use_symmetric_memory: bool
     unify_communication_stream: bool
-    prefetch_order: PrefetchOrder
     caller_managed_grad_sync: bool
     """Leave gradient synchronization to the caller instead of an autograd callback.
 
@@ -107,8 +106,7 @@ class FsdpContext:
         self.caller_managed_grad_sync = caller_managed_grad_sync
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
-        self.prefetch_order = prefetch_order
-        self._is_first_backward = True
+        self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
@@ -126,10 +124,6 @@ class FsdpContext:
             self.reduce_scatter_stream = self.allgather_stream
         else:
             self.reduce_scatter_stream = torch.cuda.Stream(device)
-
-    @property
-    def _recording_execution_order(self) -> bool:
-        return self.prefetch_order is PrefetchOrder.RECORDED and self._is_first_backward
 
     def register_module(self, module: nn.Module) -> None:
         """Register a module after its FSDP initialization completes in this context."""
@@ -157,10 +151,10 @@ class FsdpContext:
                 if module not in registered_modules:
                     continue
                 self._module_names[module] = name
-                if self.prefetch_order is PrefetchOrder.REGISTRATION:
+                if not self._recording_execution_order:
                     self.forward_order.append(module)
 
-        if self.prefetch_order is PrefetchOrder.REGISTRATION:
+        if not self._recording_execution_order:
             for root in reversed(list(self._roots)):
                 _collect_backward_order(root, registered_modules, self.backward_order)
 
@@ -212,7 +206,7 @@ class FsdpContext:
     def post_backward(self) -> None:
         """Finish backward cleanup and automatically synchronize the last microbatch."""
         self._run_delayed_post_backward_callbacks()
-        self._is_first_backward = False
+        self._recording_execution_order = False
         # Standalone training can call optimizer.step() immediately after backward.
         # Wait for reductions on the last microbatch; earlier microbatches keep
         # overlapping reduction with compute. MCore calls finish_grad_sync() itself
