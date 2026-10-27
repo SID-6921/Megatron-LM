@@ -439,8 +439,20 @@ class FsdpModule:
         context = self.context
         if context._recording_execution_order:
             context.backward_order.append(cast(nn.Module, self))
-        # Shared layers stay in BACKWARD until all uses accumulate their gradients.
-        # Initialize once, but advance prefetch for every invocation.
+        # Shared-layer MTP (mtp_use_repeated_layer=True) reuses the same FSDP block:
+        #   h1 = block(fuse(h0, shifted_embeddings_1))
+        #   h2 = block(fuse(h1, shifted_embeddings_2))
+        #   (loss1(h1) + loss2(h2)).backward()
+        # Backward enters depth 2 then depth 1, invoking this pre-hook twice.
+        # Each shared parameter's post-accumulate hook fires once after both uses
+        # contribute, so post_backward() has not reset BACKWARD when depth 1 enters.
+        # Initialize the phase and NVTX range once, but record and advance prefetch
+        # for every invocation.
+        # TODO: Separate post_backward (phase/weight release) from post_accumulate_grad
+        # (gradient reduction): https://github.com/NVIDIA/Megatron-LM/pull/7902
+        # With gradient-requiring inputs, post_backward would run once per depth,
+        # resetting the phase so the next depth can gather its weights normally.
+        # post_accumulate_grad would run once after both uses contribute gradients.
         if self.phase is not Phase.BACKWARD:
             self.phase = Phase.BACKWARD
             torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
