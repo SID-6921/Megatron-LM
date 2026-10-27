@@ -21,7 +21,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
     microbatch,
-    record_execution_order,
 )
 
 
@@ -100,14 +99,13 @@ def test_recorded_prefetch_follows_execution(distributed_setup):
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = Model().to(device)
-    with fully_shard_context(FsdpContext(device=device)) as context:
+    with fully_shard_context(FsdpContext(device=device, record_execution_order=True)) as context:
         for layer in model.children():
             fully_shard(layer, mesh, _default_placements())
         fully_shard(model, mesh, _default_placements())
 
     inputs = torch.ones(2, 4, device=device)
-    with record_execution_order(context):
-        model(inputs).sum().backward()
+    model(inputs).sum().backward()
     assert list(context.forward_order) == [model, model.first, model.second]
     assert list(context.backward_order) == [model, model.second, model.first]
 

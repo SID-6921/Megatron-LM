@@ -6,6 +6,7 @@ from typing import List, Union
 
 import torch
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     any_sharding_strategy_in,
     find_megatron_fsdp,
@@ -22,6 +23,15 @@ from megatron.core.utils import get_attr_wrapped_model
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+
+def _post_backward_fsdp(model):
+    """Complete MFSDP v2 after the schedule's last backward, through any model wrappers."""
+    while model is not None:
+        if isinstance(model, FsdpModule):
+            model.context.post_backward()
+            return
+        model = getattr(model, "module", None)
 
 
 def _release_tensor_storage(tensors):
@@ -135,6 +145,7 @@ def combined_1f1b_schedule_for_no_pipelining(
         config,
         fsdp_wrapper=fsdp_wrapper,
     )
+    _post_backward_fsdp(model)
     return forward_data_store, total_num_tokens
 
 
@@ -278,6 +289,10 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
         # model_chunk_id = num_chunks - id - 1), causing false failures in interleaved PP.
         if b_input_tensor is not None:
             assert input_tensor_grad is not None
+        if b_virtual_microbatch_id == num_microbatches * len(model) - 1:
+            # All local VPP chunks share a context; an earlier completion would
+            # end execution-order recording with only part of the schedule.
+            _post_backward_fsdp(model[b_model_chunk_id])
     return output_tensor, input_tensor_grad
 
 

@@ -40,8 +40,7 @@ class FsdpContext:
     The caller must call ``finish_grad_sync()`` after all gradient producers,
     including delayed weight-gradient computation, and before consuming gradients.
     """
-    # Prefetch uses construction order unless record_execution_order() replaces it
-    # with the order observed during a forward/backward microbatch.
+    # Prefetch uses construction order unless execution-order recording is enabled.
     forward_order: ExecutionOrder[nn.Module]
     backward_order: ExecutionOrder[nn.Module]
     # Topology metadata must not keep modules alive after construction.
@@ -60,6 +59,7 @@ class FsdpContext:
         unify_communication_stream: bool = False,
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
         caller_managed_grad_sync: bool = False,
+        record_execution_order: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -80,6 +80,11 @@ class FsdpContext:
                 retaining automatic weight cleanup. The caller must
                 call ``finish_grad_sync()`` after all backward work and before reading or
                 modifying gradients.
+            record_execution_order: Gather parameters on demand and record module calls
+                until the first ``post_backward()``. Subsequent passes prefetch using those
+                orders and must repeat them consistently across data-parallel ranks.
+                Recording currently requires the ordinary module hooks; combined 1F1B
+                bypasses them. Discard the context if the recorded pass raises.
         """
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -92,7 +97,7 @@ class FsdpContext:
         self.caller_managed_grad_sync = caller_managed_grad_sync
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
-        self._recording_execution_order = False
+        self._recording_execution_order = record_execution_order
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
@@ -137,10 +142,12 @@ class FsdpContext:
                 if module not in registered_modules:
                     continue
                 self._module_names[module] = name
-                self.forward_order.append(module)
+                if not self._recording_execution_order:
+                    self.forward_order.append(module)
 
-        for root in reversed(list(self._roots)):
-            _collect_backward_order(root, registered_modules, self.backward_order)
+        if not self._recording_execution_order:
+            for root in reversed(list(self._roots)):
+                _collect_backward_order(root, registered_modules, self.backward_order)
 
         self._registered_modules.clear()
         self.parameter_to_owner = None
@@ -188,22 +195,26 @@ class FsdpContext:
         self.current_stream().wait_stream(self.reduce_scatter_stream)
 
     def post_backward(self) -> None:
-        """Finish backward cleanup and automatically synchronize the last microbatch."""
-        self._run_delayed_post_backward_callbacks()
+        """Complete backward for all roots sharing this context."""
+        self._recording_execution_order = False
         # Standalone training can call optimizer.step() immediately after backward.
         # Wait for reductions on the last microbatch; earlier microbatches keep
         # overlapping reduction with compute. MCore calls finish_grad_sync() itself
         # after its schedule completes, including delayed weight gradients.
         if not self.caller_managed_grad_sync and self.is_last_microbatch:
             self.finish_grad_sync()
-        self._post_backward_hook_registered = False
 
-    def _run_delayed_post_backward_callbacks(self) -> None:
-        """Run deferred module completion callbacks once."""
+    def run_delayed_post_backward_callbacks(self) -> None:
+        """Run deferred weight cleanup after each backward or scheduler chunk."""
         # Finish children before parents to close nested backward NVTX ranges.
         while self._delayed_post_backward_callbacks:
             module, callback = self._delayed_post_backward_callbacks.pop()
             callback(module)
+
+    def _post_backward_hook(self) -> None:
+        self.run_delayed_post_backward_callbacks()
+        self.post_backward()
+        self._post_backward_hook_registered = False
 
     def register_post_backward_hook(self) -> None:
         """Register one final callback for deferred cleanup and optional gradient sync.
@@ -222,7 +233,7 @@ class FsdpContext:
         # TODO(wujingyue): Switch to torch.autograd.graph.queue_callback() when Megatron-LM
         # requires a PyTorch version that includes it:
         # https://github.com/pytorch/pytorch/pull/193958
-        torch.autograd.Variable._execution_engine.queue_callback(self.post_backward)
+        torch.autograd.Variable._execution_engine.queue_callback(self._post_backward_hook)
 
 
 def _collect_backward_order(
