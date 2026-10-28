@@ -1269,7 +1269,8 @@ def test_sbhd_padding_mask_is_partitioned_with_tokens(monkeypatch):
     tokens = torch.arange(16, dtype=torch.int64).view(1, 16)
     padding_mask = tokens >= 10
     batch = {"tokens": tokens.clone(), "padding_mask": padding_mask.clone()}
-    result = get_batch_on_this_cp_rank(batch, cp_group=object())
+    # Main's DCP V2 API (ea99fdfce) makes dynamic_cp a required argument.
+    result = get_batch_on_this_cp_rank(batch, dynamic_cp=False, cp_group=object())
 
     expected_indices = torch.tensor([2, 3, 12, 13])
     assert torch.equal(result["tokens"], tokens.index_select(1, expected_indices))
