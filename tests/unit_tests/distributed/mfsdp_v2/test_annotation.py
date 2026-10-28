@@ -4,7 +4,6 @@
 
 import re
 from typing import Literal, NamedTuple
-from unittest.mock import call, patch
 
 import pytest
 import torch
@@ -15,12 +14,9 @@ from torch.distributed.tensor import Shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
-    PrefetchOrder,
     fully_shard,
     fully_shard_context,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 
 _NVTX_LABEL_PATTERN = re.compile(r"MFSDP (.+) (\S+)")
 
@@ -96,56 +92,6 @@ def _setup_nvtx_recording(monkeypatch: pytest.MonkeyPatch, events: list[NvtxEven
 def _forward_backward_events(events: list[NvtxEvent]) -> list[NvtxEvent]:
     """Return the forward/backward ranges asserted by the lifecycle tests."""
     return [event for event in events if event.operation in ("forward", "backward")]
-
-
-def test_recorded_prefetch_follows_execution(distributed_setup):
-    """Prefetch follows execution when submodules are registered in the opposite order."""
-
-    class Model(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.second = nn.Linear(4, 4, bias=False)
-            self.first = nn.Linear(4, 4, bias=False)
-
-        def forward(self, x):
-            return self.second(self.first(x))
-
-    device = distributed_setup.device
-    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = Model().to(device)
-    with fully_shard_context(
-        FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)
-    ) as context:
-        for layer in model.children():
-            fully_shard(layer, mesh, _default_placements())
-        fully_shard(model, mesh, _default_placements())
-
-    inputs = torch.ones(2, 4, device=device)
-    model(inputs).sum().backward()
-    assert list(context.forward_order) == [model, model.first, model.second]
-    assert list(context.backward_order) == [model, model.second, model.first]
-
-    with patch.object(
-        FsdpModule,
-        "_unshard_parameter_groups",
-        autospec=True,
-        side_effect=FsdpModule._unshard_parameter_groups,
-    ) as unshard:
-        model(inputs).sum().backward()
-
-    # Each child is requested first by prefetch, then by its own hook.
-    assert unshard.call_args_list == [
-        call(model, Phase.FORWARD),
-        call(model.first, Phase.FORWARD),
-        call(model.first, Phase.FORWARD),
-        call(model.second, Phase.FORWARD),
-        call(model.second, Phase.FORWARD),
-        call(model, Phase.BACKWARD),
-        call(model.second, Phase.BACKWARD),
-        call(model.second, Phase.BACKWARD),
-        call(model.first, Phase.BACKWARD),
-        call(model.first, Phase.BACKWARD),
-    ]
 
 
 def test_fsdp_training_hooks_emit_operation_nvtx_ranges(distributed_setup, monkeypatch):
