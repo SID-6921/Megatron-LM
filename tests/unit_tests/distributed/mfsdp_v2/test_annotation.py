@@ -4,6 +4,7 @@
 
 import re
 from typing import Literal, NamedTuple
+from unittest.mock import call, patch
 
 import pytest
 import torch
@@ -18,6 +19,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 
 _NVTX_LABEL_PATTERN = re.compile(r"MFSDP (.+) (\S+)")
 
@@ -95,7 +98,7 @@ def _forward_backward_events(events: list[NvtxEvent]) -> list[NvtxEvent]:
     return [event for event in events if event.operation in ("forward", "backward")]
 
 
-def test_recorded_prefetch_follows_execution(distributed_setup, monkeypatch):
+def test_recorded_prefetch_follows_execution(distributed_setup):
     """Prefetch follows execution when submodules are registered in the opposite order."""
 
     class Model(nn.Module):
@@ -122,25 +125,26 @@ def test_recorded_prefetch_follows_execution(distributed_setup, monkeypatch):
     assert list(context.forward_order) == [model, model.first, model.second]
     assert list(context.backward_order) == [model, model.second, model.first]
 
-    events: list[NvtxEvent] = []
-    _setup_nvtx_recording(monkeypatch, events)
-    model(inputs).sum().backward()
+    with patch.object(
+        FsdpModule,
+        "_unshard_parameter_groups",
+        autospec=True,
+        side_effect=FsdpModule._unshard_parameter_groups,
+    ) as unshard:
+        model(inputs).sum().backward()
 
-    assert [
-        event
-        for event in events
-        if event.kind == "push" and event.operation in ("forward", "backward", "prefetch")
-    ] == [
-        NvtxEvent("push", "<root>", "forward"),
-        NvtxEvent("push", "first", "prefetch"),
-        NvtxEvent("push", "first", "forward"),
-        NvtxEvent("push", "second", "prefetch"),
-        NvtxEvent("push", "second", "forward"),
-        NvtxEvent("push", "<root>", "backward"),
-        NvtxEvent("push", "second", "prefetch"),
-        NvtxEvent("push", "second", "backward"),
-        NvtxEvent("push", "first", "prefetch"),
-        NvtxEvent("push", "first", "backward"),
+    # Each child is requested first by prefetch, then by its own hook.
+    assert unshard.call_args_list == [
+        call(model, Phase.FORWARD),
+        call(model.first, Phase.FORWARD),
+        call(model.first, Phase.FORWARD),
+        call(model.second, Phase.FORWARD),
+        call(model.second, Phase.FORWARD),
+        call(model, Phase.BACKWARD),
+        call(model.second, Phase.BACKWARD),
+        call(model.second, Phase.BACKWARD),
+        call(model.first, Phase.BACKWARD),
+        call(model.first, Phase.BACKWARD),
     ]
 
 
